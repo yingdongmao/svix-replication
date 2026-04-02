@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--username", type=str, required=True, help="WRDS username")
     parser.add_argument("--start-year", type=int, default=1996, help="Start year (default: 1996)")
     parser.add_argument("--end-year", type=int, default=2012, help="End year (default: 2012)")
-    parser.add_argument("--output", type=str, default="data/svix_results.csv", help="Output CSV path")
+    parser.add_argument("--output", type=str, default="data/svix.pkl", help="Output PKL path")
     
     args = parser.parse_args()
     
@@ -39,7 +39,7 @@ def main():
     result = compute_svix(options)
     
     # 5. Save
-    result.to_csv(args.output, index=False)
+    result.to_pickle(args.output, index=False)
     print(f"\nSuccess! Results saved to {args.output}")
     
     # Print summary
