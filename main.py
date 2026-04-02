@@ -2,7 +2,8 @@
 SVIX Replication: Main Execution Script
 
 This script uses the `svix` module to download data from WRDS,
-compute the SVIX index, and save the results to a CSV file.
+compute the SVIX index (full, up, and down variants), and save
+the results to a CSV file.
 """
 
 import argparse
@@ -34,7 +35,7 @@ def main():
     # 3. Risk-Free & Forward
     options = compute_rf_and_forward(options, zeros, index_px)
     
-    # 4. Compute SVIX
+    # 4. Compute SVIX (full, up, down)
     result = compute_svix(options)
     
     # 5. Save
@@ -48,6 +49,27 @@ def main():
         if col in result.columns:
             s = result[col].dropna()
             print(f"  {t} days: Mean={s.mean():.2f}%, Std={s.std():.2f}%, Max={s.max():.2f}%")
+
+    print("\nSummary Statistics (SVIX Index, annualised %):")
+    for t in [30, 60, 90, 180, 360]:
+        col = f'svix_index_{t}d'
+        if col in result.columns:
+            s = result[col].dropna()
+            print(f"  {t} days: Mean={s.mean():.2f}%, Std={s.std():.2f}%")
+
+    print("\nSummary Statistics (Up-SVIX — calls only, annualised %):")
+    for t in [30, 60, 90, 180, 360]:
+        col = f'up_svix_{t}d'
+        if col in result.columns:
+            s = result[col].dropna()
+            print(f"  {t} days: Mean={s.mean():.2f}%, Std={s.std():.2f}%")
+
+    print("\nSummary Statistics (Down-SVIX — puts only, annualised %):")
+    for t in [30, 60, 90, 180, 360]:
+        col = f'down_svix_{t}d'
+        if col in result.columns:
+            s = result[col].dropna()
+            print(f"  {t} days: Mean={s.mean():.2f}%, Std={s.std():.2f}%")
 
 if __name__ == "__main__":
     main()

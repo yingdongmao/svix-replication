@@ -2,8 +2,17 @@
 SVIX Computation Module
 
 This module provides functions to download OptionMetrics data from WRDS,
-clean it according to Martin (2017), and compute the SVIX index and the
-lower bound on the equity premium.
+clean it according to Martin (2017), and compute the SVIX index, the
+lower bound on the equity premium, and the one-sided SVIX variants:
+
+  - up-svix: SVIX computed using call options only (upside variance)
+  - down-svix: SVIX computed using put options only (downside variance)
+
+The one-sided integrals are computed by splitting the **combined** OTM
+option array at the forward price F, so that the CBOE discretisation
+weights (dK) are shared and the additivity property holds exactly:
+
+    SVIX² = up-SVIX² + down-SVIX²
 
 Reference:
 Martin, I. (2017). "What is the Expected Return on the Market?"
@@ -166,91 +175,211 @@ def compute_rf_and_forward(options, zeros, index_px):
     options = options.sort_values('mid').drop_duplicates(subset=['date', 'exdate', 'strike'], keep='first')
     return options
 
-def _compute_svix2_integral(grp):
-    """Compute SVIX^2 integral for a single (date, exdate) group."""
-    if len(grp) < 2: return np.nan
-    
+# ---------------------------------------------------------------------------
+# Core integral computation
+# ---------------------------------------------------------------------------
+
+def _compute_all_integrals(grp):
+    """
+    Compute the full, upside, and downside SVIX² integrals for a single
+    (date, exdate) group in a single pass.
+
+    The combined OTM option array (puts with K < F, calls with K >= F) is
+    assembled once and the CBOE discretisation weights (dK) are computed
+    once.  The upside and downside integrals are then obtained by masking
+    the shared weight array, which guarantees exact additivity:
+
+        full SVIX² == up-SVIX² + down-SVIX²
+
+    Returns
+    -------
+    dict with keys 'svix2', 'up_svix2', 'down_svix2'
+    """
+    nan_result = {'svix2': np.nan, 'up_svix2': np.nan, 'down_svix2': np.nan}
+
+    if len(grp) < 2:
+        return nan_result
+
     days = grp['days_to_expiry'].iloc[0]
-    T, R_f, S, F = days / 365.0, grp['R_f'].iloc[0], grp['S'].iloc[0], grp['F'].iloc[0]
-    
-    if any(pd.isna([R_f, S, F])) or S <= 0 or R_f <= 0: return np.nan
+    T    = days / 365.0
+    R_f  = grp['R_f'].iloc[0]
+    S    = grp['S'].iloc[0]
+    F    = grp['F'].iloc[0]
 
-    grp = grp.sort_values('strike')
-    puts = grp[(grp['cp_flag'] == 'P') & (grp['strike'] < F)][['strike', 'mid']]
+    if any(pd.isna([R_f, S, F])) or S <= 0 or R_f <= 0:
+        return nan_result
+
+    grp   = grp.sort_values('strike')
+    puts  = grp[(grp['cp_flag'] == 'P') & (grp['strike'] <  F)][['strike', 'mid']]
     calls = grp[(grp['cp_flag'] == 'C') & (grp['strike'] >= F)][['strike', 'mid']]
-    
-    otm = pd.concat([puts.rename(columns={'mid': 'price'}),
-                     calls.rename(columns={'mid': 'price'})]).sort_values('strike')
-    if len(otm) < 2: return np.nan
 
-    K, P = otm['strike'].values, otm['price'].values
-    N = len(K)
-    
-    dK = np.empty(N)
-    dK[0] = K[1] - K[0]
-    dK[-1] = K[-1] - K[-2]
-    if N > 2: dK[1:-1] = (K[2:] - K[:-2]) / 2.0
-        
-    return (2.0 / (T * R_f * S**2)) * np.sum(P * dK)
+    otm = pd.concat([
+        puts.rename(columns={'mid': 'price'}).assign(side='down'),
+        calls.rename(columns={'mid': 'price'}).assign(side='up'),
+    ]).sort_values('strike')
+
+    if len(otm) < 2:
+        return nan_result
+
+    K    = otm['strike'].values
+    P    = otm['price'].values
+    side = otm['side'].values
+    N    = len(K)
+
+    # CBOE discretisation weights — computed once on the combined array
+    dK       = np.empty(N)
+    dK[0]    = K[1]  - K[0]
+    dK[-1]   = K[-1] - K[-2]
+    if N > 2:
+        dK[1:-1] = (K[2:] - K[:-2]) / 2.0
+
+    scale = 2.0 / (T * R_f * S**2)
+
+    # Full integral
+    svix2 = scale * np.sum(P * dK)
+
+    # Upside: calls only (side == 'up')
+    mask_up   = (side == 'up')
+    up_svix2  = scale * np.sum(P[mask_up] * dK[mask_up]) if mask_up.any() else np.nan
+
+    # Downside: puts only (side == 'down')
+    mask_down   = (side == 'down')
+    down_svix2  = scale * np.sum(P[mask_down] * dK[mask_down]) if mask_down.any() else np.nan
+
+    return {'svix2': svix2, 'up_svix2': up_svix2, 'down_svix2': down_svix2}
+
+
+# ---------------------------------------------------------------------------
+# Legacy single-value wrappers (kept for backward compatibility / testing)
+# ---------------------------------------------------------------------------
+
+def _compute_svix2_integral(grp):
+    """Return full SVIX² for a single (date, exdate) group."""
+    return _compute_all_integrals(grp)['svix2']
+
+
+def _compute_up_svix2_integral(grp):
+    """Return upside SVIX² (calls only) for a single (date, exdate) group."""
+    return _compute_all_integrals(grp)['up_svix2']
+
+
+def _compute_down_svix2_integral(grp):
+    """Return downside SVIX² (puts only) for a single (date, exdate) group."""
+    return _compute_all_integrals(grp)['down_svix2']
+
+
+# ---------------------------------------------------------------------------
+# Main compute function
+# ---------------------------------------------------------------------------
 
 def compute_svix(options):
-    """Compute SVIX^2 for all expiries and interpolate to target horizons."""
-    print("Computing SVIX^2 integral per expiry...")
-    
-    svix_exp = (options.groupby(['date', 'exdate'])
-                .apply(_compute_svix2_integral)
-                .reset_index(name='svix2'))
-                
+    """
+    Compute SVIX², up-SVIX², and down-SVIX² for all expiries and interpolate
+    to target horizons (30, 60, 90, 180, 360 days).
+
+    Output columns per horizon T:
+      svix2_{T}d        – full SVIX² (puts + calls)
+      rf_{T}d           – gross risk-free rate factor
+      svix_index_{T}d   – SVIX index (annualised %, sqrt of svix2 × 100)
+      lower_bound_{T}d  – lower bound on equity premium (R_f × svix2 × 100)
+      up_svix2_{T}d     – upside SVIX² (calls only)
+      up_svix_{T}d      – upside SVIX index (annualised %, sqrt of up_svix2 × 100)
+      down_svix2_{T}d   – downside SVIX² (puts only)
+      down_svix_{T}d    – downside SVIX index (annualised %, sqrt of down_svix2 × 100)
+
+    By construction:  svix2_{T}d == up_svix2_{T}d + down_svix2_{T}d
+    """
+    print("Computing SVIX² integrals per expiry (full, up, down)...")
+
+    # Compute all three integrals in a single grouped pass
+    integral_rows = []
+    for (date, exdate), grp in options.groupby(['date', 'exdate']):
+        res = _compute_all_integrals(grp)
+        res['date']   = date
+        res['exdate'] = exdate
+        integral_rows.append(res)
+
+    svix_exp = pd.DataFrame(integral_rows)
     svix_exp['days_to_expiry'] = (svix_exp['exdate'] - svix_exp['date']).dt.days
+
+    # Drop rows where full SVIX² is invalid
     svix_exp = svix_exp.dropna(subset=['svix2'])
     svix_exp = svix_exp[svix_exp['svix2'] > 0]
 
+    # Attach risk-free rates
+    rf_map   = options[['date', 'exdate', 'R_f']].drop_duplicates()
+    svix_exp = svix_exp.merge(rf_map, on=['date', 'exdate'], how='left')
+
     print("Interpolating to target horizons...")
-    
-    def interp_targets(grp, targets):
-        grp = grp[grp['days_to_expiry'] >= MIN_DAYS_TO_EXPIRY].sort_values('days_to_expiry')
-        if len(grp) < 1: return {t: np.nan for t in targets}
-        
-        d, v = grp['days_to_expiry'].values.astype(float), grp['svix2'].values
+
+    def interp_series(grp, col, targets):
+        """Linearly interpolate a column in grp to each target day count."""
+        sub = (grp[grp['days_to_expiry'] >= MIN_DAYS_TO_EXPIRY]
+               .dropna(subset=[col])
+               .sort_values('days_to_expiry'))
+        if len(sub) < 1:
+            return {t: np.nan for t in targets}
+
+        d = sub['days_to_expiry'].values.astype(float)
+        v = sub[col].values
         out = {}
         for t in targets:
-            if len(d) == 1: out[t] = v[0]
+            if len(d) == 1:
+                out[t] = v[0]
             elif t <= d[0]:
-                slope = (v[1] - v[0]) / (d[1] - d[0]) if len(d) > 1 else 0
+                slope  = (v[1] - v[0]) / (d[1] - d[0]) if len(d) > 1 else 0
                 out[t] = max(v[0] + slope * (t - d[0]), 1e-8)
             elif t >= d[-1]:
-                slope = (v[-1] - v[-2]) / (d[-1] - d[-2]) if len(d) > 1 else 0
+                slope  = (v[-1] - v[-2]) / (d[-1] - d[-2]) if len(d) > 1 else 0
                 out[t] = max(v[-1] + slope * (t - d[-1]), 1e-8)
             else:
                 out[t] = float(interp1d(d, v, kind='linear')(t))
         return out
 
-    rf_map = options[['date', 'exdate', 'R_f']].drop_duplicates()
-    svix_exp = svix_exp.merge(rf_map, on=['date', 'exdate'], how='left')
-
     rows = []
     for date, grp in svix_exp.groupby('date'):
-        res_svix2 = interp_targets(grp, TARGET_DAYS)
-        
-        d, r = grp['days_to_expiry'].values.astype(float), grp['R_f'].values
+        res_svix2      = interp_series(grp, 'svix2',      TARGET_DAYS)
+        res_up_svix2   = interp_series(grp, 'up_svix2',   TARGET_DAYS)
+        res_down_svix2 = interp_series(grp, 'down_svix2', TARGET_DAYS)
+
+        # Interpolate risk-free rate
+        d   = grp['days_to_expiry'].values.astype(float)
+        r   = grp['R_f'].values
         res_rf = {}
         if len(d) > 0:
             for t in TARGET_DAYS:
-                if len(d) == 1: res_rf[t] = r[0]
-                elif t <= d[0]: res_rf[t] = r[0]
-                elif t >= d[-1]: res_rf[t] = r[-1]
-                else: res_rf[t] = float(interp1d(d, r, kind='linear')(t))
+                if len(d) == 1:   res_rf[t] = r[0]
+                elif t <= d[0]:   res_rf[t] = r[0]
+                elif t >= d[-1]:  res_rf[t] = r[-1]
+                else:             res_rf[t] = float(interp1d(d, r, kind='linear')(t))
         else:
             res_rf = {t: np.nan for t in TARGET_DAYS}
 
         row = {'date': date}
         for t in TARGET_DAYS:
-            svix2, rf = res_svix2[t], res_rf[t]
-            row[f'svix2_{t}d'] = svix2
-            row[f'rf_{t}d'] = rf
-            row[f'svix_index_{t}d'] = np.sqrt(svix2) * 100 if (svix2 and svix2 > 0) else np.nan
+            svix2      = res_svix2[t]
+            up_svix2   = res_up_svix2[t]
+            down_svix2 = res_down_svix2[t]
+            rf         = res_rf[t]
+
+            # Full SVIX
+            row[f'svix2_{t}d']       = svix2
+            row[f'rf_{t}d']          = rf
+            row[f'svix_index_{t}d']  = np.sqrt(svix2) * 100 if (svix2 and svix2 > 0) else np.nan
             row[f'lower_bound_{t}d'] = rf * svix2 * 100 if (svix2 and rf and svix2 > 0) else np.nan
-            
+
+            # Up-SVIX (calls only)
+            row[f'up_svix2_{t}d']    = up_svix2
+            row[f'up_svix_{t}d']     = (np.sqrt(up_svix2) * 100
+                                         if (up_svix2 and not np.isnan(up_svix2) and up_svix2 > 0)
+                                         else np.nan)
+
+            # Down-SVIX (puts only)
+            row[f'down_svix2_{t}d']  = down_svix2
+            row[f'down_svix_{t}d']   = (np.sqrt(down_svix2) * 100
+                                         if (down_svix2 and not np.isnan(down_svix2) and down_svix2 > 0)
+                                         else np.nan)
+
         rows.append(row)
 
     return pd.DataFrame(rows).sort_values('date').reset_index(drop=True)
