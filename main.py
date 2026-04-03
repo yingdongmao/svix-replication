@@ -21,10 +21,12 @@ def main():
     
     print("="*60)
     print(f"SVIX Replication: {args.start_year} to {args.end_year}")
-    print("="*60)
+    print("=" * 60)
     
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    # Ensure output directory exists if one was provided
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     
     # 1. Download
     options, zeros, index_px = download_data(args.start_year, args.end_year, args.username)
@@ -39,7 +41,7 @@ def main():
     result = compute_svix(options)
     
     # 5. Save
-    result.to_pickle(args.output, index=False)
+    result.to_pickle(args.output)
     print(f"\nSuccess! Results saved to {args.output}")
     
     # Print summary
